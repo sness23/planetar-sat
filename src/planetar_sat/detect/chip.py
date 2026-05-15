@@ -1,7 +1,14 @@
 """SAR scene → detection batch.
 
 Wraps the CFAR detector with rasterio I/O: opens a Sentinel-1 GRD GeoTIFF,
-runs CFAR over the VV pol, and projects pixel coordinates back to lat/lon.
+runs CFAR over the VV pol, geo-references each detection to lon/lat, and
+drops any that land on shore.
+
+Geo-referencing has two paths:
+  - the raster carries a CRS + affine transform — use it directly;
+  - the raster is in radar geometry with no CRS (the usual case for a
+    Sentinel-1 GRD measurement tiff) — fall back to the geolocation grid in
+    the sibling annotation XML (see `geocode.py`).
 """
 from __future__ import annotations
 
@@ -11,7 +18,9 @@ from pathlib import Path
 
 import numpy as np
 
-from planetar_sat.detect.cfar import Detection, cfar_ca
+from planetar_sat.detect.cfar import cfar_ca
+from planetar_sat.detect.geocode import Geocoder, find_annotation
+from planetar_sat.detect.landmask import is_land
 
 log = logging.getLogger(__name__)
 
@@ -31,16 +40,22 @@ def detect_scene(
     scene_id: str,
     acquired_at_ns: int,
     cfar_kwargs: dict | None = None,
+    annotation_path: Path | None = None,
+    mask_land: bool = True,
 ) -> list[GeoDetection]:
-    """Run CFAR on a single VV GRD GeoTIFF and return geo-referenced detections."""
-    try:
-        import rasterio
-        from rasterio.transform import xy
-    except ImportError as e:  # pragma: no cover
-        raise RuntimeError(
-            "rasterio is required for scene detection. `pip install rasterio` "
-            "or `make install`."
-        ) from e
+    """Run CFAR on a single VV GRD GeoTIFF and return geo-referenced detections.
+
+    Args:
+        tif_path:        VV-polarization Sentinel-1 GRD GeoTIFF.
+        scene_id:        stable scene identifier, stamped on every detection.
+        acquired_at_ns:  scene acquisition time (ns), stamped on every detection.
+        cfar_kwargs:     extra args forwarded to `cfar_ca`.
+        annotation_path: S1 annotation XML for the geolocation grid. If omitted
+                         and the raster has no CRS, a sibling XML is looked up.
+        mask_land:       drop detections that geocode onto land (default True).
+    """
+    import rasterio
+    from rasterio.transform import xy
 
     with rasterio.open(tif_path) as ds:
         band = ds.read(1).astype(np.float32)
@@ -48,22 +63,41 @@ def detect_scene(
         crs = ds.crs
 
     dets = cfar_ca(band, **(cfar_kwargs or {}))
+    if not dets:
+        log.info("scene %s: 0 detections", scene_id)
+        return []
+
+    rows = np.array([d.row for d in dets], dtype=np.float64)
+    cols = np.array([d.col for d in dets], dtype=np.float64)
+
+    # --- geo-referencing ---
+    if crs is not None:
+        xs, ys = xy(transform, rows, cols)
+        xs, ys = np.asarray(xs, dtype=np.float64), np.asarray(ys, dtype=np.float64)
+        if crs.to_epsg() != 4326:
+            from rasterio.warp import transform as warp_transform
+
+            xs, ys = warp_transform(crs, "EPSG:4326", xs.tolist(), ys.tolist())
+            xs, ys = np.asarray(xs), np.asarray(ys)
+        lons, lats = xs, ys
+    else:
+        ann = annotation_path or find_annotation(tif_path)
+        if ann is None:
+            raise RuntimeError(
+                f"{Path(tif_path).name} has no CRS and no sibling annotation "
+                "XML — cannot geo-reference detections. Pass annotation_path "
+                "with the Sentinel-1 geolocation-grid XML."
+            )
+        geocoder = Geocoder.from_annotation(ann)
+        lons, lats = geocoder.lonlat_many(rows, cols)
+
+    # --- land masking ---
+    on_land = is_land(lats, lons) if mask_land else np.zeros(len(dets), dtype=bool)
+
     geo_dets: list[GeoDetection] = []
-    for d in dets:
-        # rasterio xy() returns (x, y) in dataset CRS. For lat/lon we'd need a
-        # reproject if CRS isn't already 4326. Sentinel-1 GRD on Copernicus is
-        # typically WGS84-aligned EPSG:4326 after Level-1 GRD processing, but
-        # full IW SLC products use UTM. We project explicitly when needed.
-        x, y = xy(transform, d.row, d.col)
-        if crs is not None and crs.to_epsg() != 4326:
-            try:
-                from rasterio.warp import transform as warp_transform
-                xs, ys = warp_transform(crs, "EPSG:4326", [x], [y])
-                lon, lat = xs[0], ys[0]
-            except Exception:  # pragma: no cover
-                lon, lat = float("nan"), float("nan")
-        else:
-            lon, lat = x, y
+    for d, lat, lon, land in zip(dets, lats, lons, on_land, strict=True):
+        if land:
+            continue
         geo_dets.append(
             GeoDetection(
                 scene_id=scene_id,
@@ -74,5 +108,8 @@ def detect_scene(
                 acquired_at_ns=acquired_at_ns,
             )
         )
+    n_land = int(on_land.sum())
+    if n_land:
+        log.info("scene %s: dropped %d land detections", scene_id, n_land)
     log.info("scene %s: %d geo-detections", scene_id, len(geo_dets))
     return geo_dets

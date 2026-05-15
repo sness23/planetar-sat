@@ -154,7 +154,13 @@ def fetch(
 @click.option("--guard", default=4, type=int)
 @click.option("--train", default=12, type=int)
 @click.option("--pfa-factor", default=3.0, type=float)
-def detect(inputs: tuple[str, ...], guard: int, train: int, pfa_factor: float) -> None:
+@click.option("--annotation", default=None, type=click.Path(exists=True),
+              help="Sentinel-1 annotation XML for the geolocation grid — needed "
+                   "when the GeoTIFF carries no CRS (radar-geometry GRD products)")
+@click.option("--no-land-mask", is_flag=True,
+              help="keep detections that fall on land (skip the land filter)")
+def detect(inputs: tuple[str, ...], guard: int, train: int, pfa_factor: float,
+           annotation: str | None, no_land_mask: bool) -> None:
     """Run CFAR over one or more SAR GeoTIFFs. Prints JSON-lines detections."""
     if not inputs:
         raise click.UsageError("provide one or more .tif paths")
@@ -163,7 +169,12 @@ def detect(inputs: tuple[str, ...], guard: int, train: int, pfa_factor: float) -
         path = Path(tif)
         # acquired_at_ns: prefer file mtime; real pipeline parses .SAFE/manifest.safe.
         acquired_ns = int(path.stat().st_mtime * 1e9)
-        dets = detect_scene(path, scene_id=path.stem, acquired_at_ns=acquired_ns, cfar_kwargs=cfar_kwargs)
+        dets = detect_scene(
+            path, scene_id=path.stem, acquired_at_ns=acquired_ns,
+            cfar_kwargs=cfar_kwargs,
+            annotation_path=Path(annotation) if annotation else None,
+            mask_land=not no_land_mask,
+        )
         for d in dets:
             click.echo(json.dumps(asdict(d), default=str))
 
@@ -177,9 +188,12 @@ def detect(inputs: tuple[str, ...], guard: int, train: int, pfa_factor: float) -
 @click.option("--cache-dir", default=str(DEFAULT_CACHE_DIR), type=click.Path())
 @click.option("--broker", default=DEFAULT_BROKER, help="host:port for planetar-broker publish port")
 @click.option("--chat-channel", default="sar-detections", help="planetar-ui channel name to mirror chat lines to")
+@click.option("--no-land-mask", is_flag=True,
+              help="keep detections that fall on land (skip the land filter)")
 def run(
     aoi: str, days: int, start: str | None, end: str | None,
     max_results: int, cache_dir: str, broker: str, chat_channel: str,
+    no_land_mask: bool,
 ) -> None:
     """End-to-end: fetch → detect → track → publish to planetar-broker.
 
@@ -212,7 +226,8 @@ def run(
                 continue
             tif = tif_candidates[0]
             acquired_ns = int(p.sensing_start.timestamp() * 1e9)
-            dets = detect_scene(tif, scene_id=p.scene_id, acquired_at_ns=acquired_ns)
+            dets = detect_scene(tif, scene_id=p.scene_id, acquired_at_ns=acquired_ns,
+                                mask_land=not no_land_mask)
             n_pub = _publish_scene_results(pub, p.scene_id, dets, tracker, chat_channel,
                                            historical_ns=acquired_ns)
             click.echo(f"scene {p.scene_id}: {len(dets)} dets, {n_pub} envelopes published")
@@ -227,8 +242,14 @@ def run(
 @click.option("--acquired-at",
               help="ISO timestamp to stamp on chat.created_at_ns (overrides file mtime). "
                    "Apply to all scenes — useful for narrating a specific historical event.")
+@click.option("--annotation", default=None, type=click.Path(exists=True),
+              help="Sentinel-1 annotation XML for the geolocation grid — needed "
+                   "when the GeoTIFF carries no CRS (radar-geometry GRD products)")
+@click.option("--no-land-mask", is_flag=True,
+              help="keep detections that fall on land (skip the land filter)")
 def replay(scenes: tuple[str, ...], broker: str, chat_channel: str,
-           rate: float, acquired_at: str | None) -> None:
+           rate: float, acquired_at: str | None,
+           annotation: str | None, no_land_mask: bool) -> None:
     """Replay already-downloaded scenes through the bus.
 
     No CDSE auth needed — operates on local GeoTIFFs. Chat envelopes carry the
@@ -250,7 +271,9 @@ def replay(scenes: tuple[str, ...], broker: str, chat_channel: str,
         for tif in scenes:
             path = Path(tif)
             acquired_ns = override_ns if override_ns is not None else int(path.stat().st_mtime * 1e9)
-            dets = detect_scene(path, scene_id=path.stem, acquired_at_ns=acquired_ns)
+            dets = detect_scene(path, scene_id=path.stem, acquired_at_ns=acquired_ns,
+                                annotation_path=Path(annotation) if annotation else None,
+                                mask_land=not no_land_mask)
             n_pub = _publish_scene_results(pub, path.stem, dets, tracker, chat_channel,
                                            historical_ns=acquired_ns)
             click.echo(f"replay {path.stem}: {len(dets)} dets, {n_pub} envelopes")

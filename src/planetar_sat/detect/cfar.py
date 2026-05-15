@@ -20,6 +20,7 @@ import logging
 from dataclasses import dataclass
 
 import numpy as np
+from scipy import ndimage
 
 log = logging.getLogger(__name__)
 
@@ -88,89 +89,33 @@ def cfar_ca(
     threshold = pfa_factor * clutter_mean
     mask = img > threshold
 
-    # Connected-component labeling (4-connectivity, pure numpy/scipy-free).
+    # Connected-component labeling. scipy's labeler is vectorized C — it scales
+    # to full GRD scenes, where a pure-Python labeler would run for minutes.
+    # Default structuring element is the 4-connectivity cross.
     detections: list[Detection] = []
-    labels = _label_4(mask)
-    n_labels = labels.max()
+    labels, n_labels = ndimage.label(mask)
     if n_labels == 0:
         return detections
     snr_map = img / clutter_mean
+    sizes = np.bincount(labels.ravel())
+    boxes = ndimage.find_objects(labels)
     for lab in range(1, n_labels + 1):
-        ys, xs = np.where(labels == lab)
-        if ys.size < min_pixels:
+        if sizes[lab] < min_pixels:
             continue
-        r0, r1 = int(ys.min()), int(ys.max())
-        c0, c1 = int(xs.min()), int(xs.max())
-        # Use the brightest pixel in the blob as the representative location.
-        sub = img[r0 : r1 + 1, c0 : c1 + 1]
-        peak_idx = np.unravel_index(np.argmax(sub), sub.shape)
-        pr, pc = int(peak_idx[0]) + r0, int(peak_idx[1]) + c0
+        sr, sc = boxes[lab - 1]
+        r0, c0 = sr.start, sc.start
+        # Brightest pixel within the blob is the representative location.
+        blob = np.where(labels[sr, sc] == lab, img[sr, sc], -np.inf)
+        pr_off, pc_off = np.unravel_index(np.argmax(blob), blob.shape)
+        pr, pc = int(pr_off) + r0, int(pc_off) + c0
         detections.append(
             Detection(
                 row=pr,
                 col=pc,
                 snr=float(snr_map[pr, pc]),
-                bbox=(r0, c0, r1, c1),
+                bbox=(r0, c0, sr.stop - 1, sc.stop - 1),
                 peak=float(img[pr, pc]),
             )
         )
     log.info("CFAR found %d detections (image %dx%d)", len(detections), H, W)
     return detections
-
-
-def _label_4(mask: np.ndarray) -> np.ndarray:
-    """4-connectivity connected components. Two-pass union-find. Pure numpy."""
-    H, W = mask.shape
-    labels = np.zeros((H, W), dtype=np.int32)
-    parent: list[int] = [0]
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a: int, b: int) -> None:
-        ra, rb = find(a), find(b)
-        if ra == rb:
-            return
-        if ra < rb:
-            parent[rb] = ra
-        else:
-            parent[ra] = rb
-
-    next_label = 1
-    for r in range(H):
-        for c in range(W):
-            if not mask[r, c]:
-                continue
-            up = labels[r - 1, c] if r > 0 else 0
-            left = labels[r, c - 1] if c > 0 else 0
-            if up == 0 and left == 0:
-                labels[r, c] = next_label
-                parent.append(next_label)
-                next_label += 1
-            elif up != 0 and left == 0:
-                labels[r, c] = up
-            elif up == 0 and left != 0:
-                labels[r, c] = left
-            else:
-                lo = min(up, left)
-                labels[r, c] = lo
-                union(up, left)
-
-    # Second pass: flatten labels via union-find roots, then renumber densely.
-    remap: dict[int, int] = {}
-    next_id = 0
-    for i in range(1, next_label):
-        root = find(i)
-        if root not in remap:
-            next_id += 1
-            remap[root] = next_id
-    flat = np.zeros_like(labels)
-    for r in range(H):
-        for c in range(W):
-            v = labels[r, c]
-            if v:
-                flat[r, c] = remap[find(v)]
-    return flat

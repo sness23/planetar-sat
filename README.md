@@ -15,10 +15,10 @@ Salish Sea) and for the `zdefence` v1 project.
 planetar-sat/
 ├── src/planetar_sat/
 │   ├── fetch/        # Copernicus Data Space (CDSE) Sentinel-1 GRD fetcher
-│   ├── detect/       # CFAR baseline SAR ship detector
+│   ├── detect/       # CFAR detector + geolocation-grid geocoder + land mask
 │   ├── track/        # IoU multi-target tracker (persistent IDs)
 │   ├── bus/          # zmesg encoder + TCP publisher to planetar-broker
-│   ├── cli.py        # `planetar-sat fetch|detect|track|run`
+│   ├── cli.py        # `planetar-sat fetch|detect|run|replay`
 │   └── config.py
 ├── tests/
 └── docs/
@@ -60,9 +60,22 @@ time so the UI renders messages at the right wall-clock — not as "now."
 | `sar.chip`    | JSON: `{scene_id, lat, lon, snr, bbox_px, acquired_at_ns}`            | `detect/cfar.py`   |
 | `track.update`| JSON: `{track_id, lat, lon, speed_kn, course_deg, last_seen_ns, ...}` | `track/tracker.py` |
 
-Wire framing matches the broker: 4-byte little-endian length prefix, then a
-`zmesg` envelope (see `src/planetar_sat/bus/zmesg.py` — pure-Python mirror of
-`~/github/sness23/zmesg/zmesg.h`).
+Wire framing matches the broker: 4-byte **big-endian** (network byte order)
+length prefix, then a `zmesg` envelope (see `src/planetar_sat/bus/zmesg.py` —
+pure-Python mirror of `~/github/sness23/zmesg/zmesg.h`).
+
+## Geo-referencing & land masking
+
+A Sentinel-1 GRD measurement GeoTIFF is delivered in radar (range/azimuth)
+geometry — it carries **no CRS**. `detect/geocode.py` recovers real
+coordinates by interpolating the geolocation grid in the product's
+annotation XML (a lattice of line/pixel → lat/lon ground-control points).
+For a loose tiff, pass `--annotation <s1-annotation>.xml`.
+
+CFAR is a ship-vs-water detector and floods with false alarms over land, so
+detections that geocode onto land are dropped (`detect/landmask.py`, backed
+by `global_land_mask`). Pass `--no-land-mask` to keep them — useful for
+synthetic test scenes and debugging.
 
 ## Datasets in scope (CH13 1a)
 
@@ -79,6 +92,18 @@ across all five sensor lanes.
 
 ## Status
 
-v0.1 — scaffold. CFAR baseline is honest (no fake numbers). Chip classifier
-head is not in this commit; the proposal's `sar.chip` plan is CFAR-first +
-classifier-port-from-xView3-reference. That port lives in a follow-on commit.
+v0.2 — working detector pipeline (no fake numbers).
+
+- **CFAR** cell-averaging detector (summed-area-table) with a scipy-vectorized
+  connected-component labeller — a 16-Mpx window runs in seconds.
+- **Geo-referencing** via the Sentinel-1 geolocation grid (radar-geometry
+  products have no CRS).
+- **Land masking** drops CFAR's land false alarms. Validated on a real
+  Sentinel-1C scene: a land window collapsed 1582 → 28 detections; an
+  open-water window kept all 19.
+
+Honest limitations: `detect_scene` reads the whole band, so a full 433-Mpx
+GRD scene exceeds memory — tiled reads are the next step. The 1-arcmin land
+mask is coarse near complex shorelines; a full-resolution coastline (GSHHG)
+is the production upgrade. The chip-classifier head (xView3 port) is still a
+follow-on.
