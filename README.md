@@ -107,3 +107,8 @@ GRD scene exceeds memory — tiled reads are the next step. The 1-arcmin land
 mask is coarse near complex shorelines; a full-resolution coastline (GSHHG)
 is the production upgrade. The chip-classifier head (xView3 port) is still a
 follow-on.
+
+## Licensing
+
+Licensed under **AGPL-3.0** (see [`LICENSE`](LICENSE)). **Commercial licenses**
+(for use without AGPL obligations) are available — contact `sness@sness.net`.
